@@ -4,16 +4,7 @@ Web API .NET 8 che riceve `targa` e `numeroVerbale`, li salva in memoria e rispo
 
 ## Endpoint
 
-`POST /api/verbali`
-
-### Body
-
-```json
-{
-  "targa": "AB123CD",
-  "numeroVerbale": "12345"
-}
-```
+`GET /api/verbali/VerificaImporto?targa=AB123CD&numeroVerbale=12345`
 
 ### Risposta
 

@@ -15,11 +15,11 @@ public sealed class VerbaliController : ControllerBase
         _store = store;
     }
 
-    [HttpPost]
-    public ActionResult<VerbaleResponse> Post([FromBody] VerbaleRequest request)
+    [HttpGet("VerificaImporto")]
+    public ActionResult<VerbaleResponse> VerificaImporto([FromQuery] string targa, [FromQuery] string numeroVerbale)
     {
         var ricevutoIl = DateTimeOffset.Now;
-        var response = _store.Save(request.Targa, request.NumeroVerbale, ricevutoIl);
+        var response = _store.Save(targa, numeroVerbale, ricevutoIl);
         return Ok(response);
     }
 }
