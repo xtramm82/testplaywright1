@@ -2,6 +2,11 @@ using System.ComponentModel.DataAnnotations;
 
 namespace testplaywright1.Models;
 
-public sealed record VerbaleRequest(
-    [property: Required, MinLength(1)] string Targa,
-    [property: Required, MinLength(1)] string NumeroVerbale);
+public class VerbaleRequest()
+{
+    public string Targa { get; set; }
+    public string NumeroVerbale { get; set; }
+    public decimal Importo { get; set; }
+    public bool ForzaPagamento { get; set; }
+    public string EmailNotifica{ get; set; }
+}

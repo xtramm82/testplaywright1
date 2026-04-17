@@ -1,8 +1,11 @@
-using System.Globalization;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.Playwright;
+using System.Globalization;
+using System.Text.RegularExpressions;
 using testplaywright1.Models;
-using testplaywright1.Services;
 
 namespace testplaywright1.Controllers;
 
@@ -10,23 +13,18 @@ namespace testplaywright1.Controllers;
 [Route("api/[controller]")]
 public sealed class VerbaliController : ControllerBase
 {
-    private readonly VerbaleStore _store;
 
-    public VerbaliController(VerbaleStore store)
-    {
-        _store = store;
-    }
 
     [HttpGet("VerificaImporto")]
-    public async Task<ActionResult<object>> VerificaImporto([FromQuery] string targa, [FromQuery] string numeroVerbale, [FromQuery] string importo)
+    public async Task<ActionResult<object>> VerificaImporto([FromQuery] VerbaleRequest request)
     {
-        var ricevutoIl = DateTimeOffset.Now;
-        var response = _store.Save(targa, numeroVerbale, ricevutoIl);
 
+        // SETUP
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
         {
-            Headless = true
+            Headless = false,
+            Timeout = 10000
         });
 
         var page = await browser.NewPageAsync(new BrowserNewPageOptions
@@ -34,96 +32,162 @@ public sealed class VerbaliController : ControllerBase
             ViewportSize = new ViewportSize { Width = 1440, Height = 1600 }
         });
 
+        // CARICO LA PAGINA
         await page.GotoAsync("https://tfl.gov.uk/modes/driving/pay-a-pcn", new PageGotoOptions
         {
             WaitUntil = WaitUntilState.NetworkIdle
         });
 
+        //CHIUDO IL BANNER DEI COOKIES
         await CloseCookieBannerAsync(page);
 
+        //RIEMPIO I CAMPI TARGA E VERBALE E CLICCO CONTINUA
         var pcnInput = page.GetByLabel("PCN number", new() { Exact = false });
         var plateInput = page.GetByLabel("Plate", new() { Exact = false });
 
-        await pcnInput.FillAsync(numeroVerbale);
-        await plateInput.FillAsync(targa);
+        await pcnInput.FillAsync(request.NumeroVerbale);
+        await plateInput.FillAsync(request.Targa);
 
-        var continueButton = page.Locator("#pcn-entry-button");
-        await continueButton.ClickAsync(new LocatorClickOptions { Force = true });
+        var goToFine = page.GetByRole(AriaRole.Button, new() { Name = "Continue" });
+        await goToFine.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 3000 });
+        if (await goToFine.CountAsync() == 0)
+            return reportError(request, page, "go to fine (continue) button not found");
+
+        await goToFine.First.ClickAsync(new LocatorClickOptions { Force = true });
         await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
 
+
+        // VERIFICO L'ERRORE PER MULTA NON TROVATA
+        var errorFound = page.GetByText("try again");
+        if (await errorFound.CountAsync() > 0)
+            return reportError(request, page, "fine not found");
+
+        //RECUPERO L'IMPORTO E LO VERIFICO
         var outstandingAmountLocator = page.GetByText("Outstanding amount", new() { Exact = false });
         string? outstandingAmount = null;
-        try
-        {
-            await outstandingAmountLocator.WaitForAsync(new LocatorWaitForOptions { Timeout = 15000 });
-            outstandingAmount = await ExtractOutstandingAmountAsync(page);
-        }
-        catch
-        {
-        }
+        await outstandingAmountLocator.WaitForAsync(new LocatorWaitForOptions { Timeout = 3000 });
+        outstandingAmount = await ExtractOutstandingAmountAsync(page);
 
-        bool? match = null;
         if (outstandingAmount is not null)
-        {
-            match = NormalizeMoney(importo) == NormalizeMoney(outstandingAmount);
-        }
+            if (request.Importo != NormalizeMoney(outstandingAmount) && !request.ForzaPagamento)
+            {
+                return reportError(request, page, "amount mismatch");
+            }
 
-        bool? payable = null;
-        string? importoDaPagare = null;
-
+        // AGGIUNGO LA MULTA AL CARRELLO
         var addToBasket = page.GetByRole(AriaRole.Button, new() { Name = "Add to basket" });
-        try
-        {
-            if (await addToBasket.CountAsync() > 0)
-            {
-                var first = addToBasket.First;
-                await first.ClickAsync(new LocatorClickOptions { Force = true });
-                await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+        await addToBasket.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 3000 });
+        if (await addToBasket.CountAsync() == 0)
+            return reportError(request, page, "add to basket button not found (not payable?)");
 
-                var postClickText = await page.Locator("body").InnerTextAsync();
-                payable = true;
-                if (!postClickText.Contains("added to basket", StringComparison.OrdinalIgnoreCase) &&
-                    !postClickText.Contains("Go to basket", StringComparison.OrdinalIgnoreCase))
-                {
-                    payable = null;
-                }
+        var first = addToBasket.First;
+        await first.ClickAsync(new LocatorClickOptions { Force = true });
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
 
-                var goToBasket = page.GetByRole(AriaRole.Link, new() { Name = "Go to basket" });
-                if (await goToBasket.CountAsync() == 0)
-                    goToBasket = page.GetByRole(AriaRole.Button, new() { Name = "Go to basket" });
+        // VADO AL CARRELLO
+        var goToBasket = page.GetByRole(AriaRole.Link, new() { Name = "Go to basket" });
+        await goToBasket.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 3000 });
 
-                if (await goToBasket.CountAsync() > 0)
-                {
-                    await goToBasket.First.ClickAsync(new LocatorClickOptions { Force = true });
-                    await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
-                    importoDaPagare = await ExtractTotalAsync(page);
-                }
-            }
-            else
-            {
-                payable = false;
-            }
-        }
-        catch
-        {
-            payable = false;
-        }
+        if (await goToBasket.CountAsync() == 0)
+            return reportError(request, page, "go to basket not found");
+
+        await goToBasket.First.ClickAsync(new LocatorClickOptions { Force = true });
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+        string importoDaPagare = await ExtractTotalAsync(page);
+
+        // IMPOSTO LA MAIL EPR LA RICEVUTA E PROSEGUO
+        await page.Locator("#checkbox-accordion").CheckAsync(new LocatorCheckOptions { Force = true });
+
+        await page.Locator("#EmailAddress").FillAsync(request.EmailNotifica);
+
+        var confirmAndPay = page.GetByRole(AriaRole.Button, new() { Name = "Confirm and pay" });
+        await confirmAndPay.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 3000 });
+        if (await confirmAndPay.CountAsync() == 0)
+            return reportError(request, page, "confirm and pay button not found");
+
+        await confirmAndPay.First.ClickAsync(new LocatorClickOptions { Force = true });
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+
+        // IMPOSTO I DATI DELLA CARTA E CLICCO SU CONTINUA
+        await page.Locator("#scp_cardPage_cardNumber_input").FillAsync("4293189100000008");
+
+        // 2. Inserimento Data di Scadenza (Mese/Anno)
+        await page.Locator("#scp_cardPage_expiryDate_input").FillAsync("12"); // Esempio: Mese
+        await page.Locator("#scp_cardPage_expiryDate_input2").FillAsync("27"); // Esempio: Anno
+        await page.Locator("#scp_cardPage_csc_input").FillAsync("123");
+        await page.Locator("#scp_cardPage_buttonsNoBack_continue_button").ClickAsync();
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+
+        // VERIFICO L'ERRORE PER I DATI DELLA CARTA
+        errorFound = page.GetByText("Security Code");
+        if (await errorFound.CountAsync() > 0)
+            return reportError(request, page, "card detail page error");
+
+
+        // INSERISCO I DETTAGLI SUL POSSESSORE DELLA CARTA
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_cardholderName_input").FillAsync("NOME TITOLARE");
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_address_1_input").FillAsync("INDIRIZZO RIGA 1");
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_city_input").FillAsync("CITTA");
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_postcode_input").FillAsync("CAP");
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_email_input").FillAsync(request.EmailNotifica);
+        await page.Locator("#scp_tdsv2AdditionalInfoPage_buttons_continue_button").ClickAsync();
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+
+        // VERIFICO L'ERRORE PER I DATI DEL TITOLARE DELLA CARTA
+        errorFound = page.GetByText("Cardholder Billing Information");
+        if (await errorFound.CountAsync() > 0)
+            return reportError(request, page, "card holder page error");
+
+        // CONFERMO ED EFFETTUO IL PAGAMENTO
+        var makePayment = page.GetByRole(AriaRole.Button, new() { Name = "Make Payment" });
+        await makePayment.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 3000 });
+        if (await makePayment.CountAsync() == 0)
+            return reportError(request, page, "make payment button not found");
+
+        await makePayment.First.ClickAsync(new LocatorClickOptions { Force = true });
+        await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+
+        // VERIFICO L'ERRORE PER IL 3D SECURE
+        errorFound = page.GetByText("Secure authorisation");
+        if (await errorFound.CountAsync() > 0)
+            return reportError(request, page, "3d secure auth required");
+
+        // VERIFICO L'ERRORE PER CARTA RIFIUTATA
+        errorFound = page.GetByText("Card Declined");
+        if (await errorFound.CountAsync() > 0)
+            return reportError(request, page, "card declined error");
+
+
 
         var bodyText = await page.Locator("body").InnerTextAsync();
 
-        return Ok(new
+        return Ok(new VerbaleResponse
         {
-            response.Targa,
-            response.NumeroVerbale,
-            ImportoInIngresso = importo,
-            OutstandingAmount = outstandingAmount,
-            Match = match,
-            Payable = payable,
-            ImportoDaPagare = importoDaPagare,
-            response.DataRicevimento,
-            response.Riassunto,
+            Targa = request.Targa,
+            NumeroVerbale = request.NumeroVerbale,
+            Importo = request.Importo,
+            ImportoDaPagare = NormalizeMoney(outstandingAmount),
+            DataRicevimento = DateTime.Now,
             ContenutoPagina = bodyText,
             CurrentUrl = page.Url
+        });
+    }
+
+    private ActionResult<object> reportError(VerbaleRequest request, IPage page, string msg)
+    {
+        var bodyTextTask = page.Locator("body").InnerTextAsync();
+        bodyTextTask.Wait(); // Sincronizza per ottenere il risultato in modo sincrono
+        var bodyText = bodyTextTask.Result;
+
+        return BadRequest(new VerbaleResponse
+        {
+            Targa = request.Targa,
+            NumeroVerbale = request.NumeroVerbale,
+            Importo = request.Importo,
+            DataRicevimento = DateTime.Now,
+            ContenutoPagina = bodyText,
+            CurrentUrl = page.Url,
+            Errore = msg
         });
     }
 
@@ -155,52 +219,28 @@ public sealed class VerbaliController : ControllerBase
         return null;
     }
 
-    private static string NormalizeMoney(string value)
+    private static decimal? NormalizeMoney(string value)
     {
         var s = value.Trim();
         s = s.Replace("£", "", StringComparison.OrdinalIgnoreCase).Trim();
         if (decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var d))
-            return d.ToString("0.00", CultureInfo.InvariantCulture);
+            return d;
         if (decimal.TryParse(s, NumberStyles.Any, CultureInfo.GetCultureInfo("en-GB"), out d))
-            return d.ToString("0.00", CultureInfo.InvariantCulture);
-        return s;
+            return d;
+        return null;
     }
 
     private static async Task CloseCookieBannerAsync(IPage page)
     {
-        var selectors = new[]
+        var locator = page.Locator("button:has-text('Accept all')").First;
+        if (await locator.CountAsync() > 0)
         {
-            "#cb-cookieoverlay",
-            "button:has-text('Accept all')",
-            "button:has-text('Accept')",
-            "button:has-text('I accept')",
-            "button:has-text('Agree')",
-            "button:has-text('OK')",
-            "button:has-text('Close')",
-            "[aria-label*='cookie' i]",
-            "[id*='cookie' i] button",
-        };
+            await locator.ClickAsync(new LocatorClickOptions { Timeout = 3000 });
 
-        foreach (var selector in selectors)
-        {
-            try
+            locator = page.Locator("#cb-cookieoverlay");
+            if (await locator.CountAsync() > 0)
             {
-                var locator = page.Locator(selector).First;
-                if (await locator.CountAsync() > 0)
-                {
-                    if (selector == "#cb-cookieoverlay")
-                    {
-                        await page.EvaluateAsync("document.querySelector('#cb-cookieoverlay')?.remove();");
-                    }
-                    else
-                    {
-                        await locator.ClickAsync(new LocatorClickOptions { Force = true, Timeout = 3000 });
-                    }
-                    break;
-                }
-            }
-            catch
-            {
+                await page.EvaluateAsync("document.querySelector('#cb-cookieoverlay')?.remove();");
             }
         }
     }
